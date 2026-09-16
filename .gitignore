@@ -1,0 +1,23 @@
+# PhotoTrans 网盘服务端 .gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 构建产物（EXE 可重建）
+build/
+dist/
+
+# PyInstaller spec 中间产物
+*.toc
+*.manifest
+
+# 日志
+*.log
+
+# 运行时数据（用户配置 + 设备令牌，含凭据）
+.phototransdrive/
+
+# 临时
+*.tmp
