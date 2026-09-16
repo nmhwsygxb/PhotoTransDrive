@@ -21,3 +21,4 @@ dist/
 
 # 临时
 *.tmp
+.testtmp/
