@@ -1,0 +1,6 @@
+# PhotoTrans 网盘服务端依赖
+# 核心 server.py / web_ui.py 仅使用 Python 标准库，无需额外安装。
+# 可选依赖：生成手机扫码连接二维码 PNG 需要 qrcode（+pillow）。
+#   安装：pip install qrcode pillow
+qrcode>=7.0
+pillow>=10.0

@@ -65,6 +65,32 @@ def get_ipv6_address() -> str | None:
     优先返回全球单播地址（2xxx/3xxx），其次返回链路本地（fe80::）。
     返回 None 表示无 IPv6 连接。
     """
+    # Windows: 优先用 netsh 枚举，跳过临时地址（隐私扩展地址会过期变化）
+    if os.name == "nt":
+        try:
+            out = subprocess.run(
+                ["netsh", "interface", "ipv6", "show", "addresses"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=10,
+            ).stdout
+            fallback: str | None = None
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[0] in ("Temporary", "Public", "Other", "临时", "公共", "公用", "其他"):
+                    atype, addr = parts[0], parts[-1]
+                    addr = addr.split("%")[0]
+                    if addr.startswith("fe80") or addr == "::1":
+                        continue
+                    # 中英文环境：Temporary/临时=隐私扩展地址，Public/公共/公用=稳定地址
+                    if atype in ("Public", "公共", "公用"):
+                        return addr
+                    if fallback is None:
+                        fallback = addr
+            if fallback:
+                return fallback
+        except Exception:
+            pass
+
     # 尝试获取全球单播 IPv6
     try:
         s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
@@ -156,6 +182,13 @@ MAX_CONCURRENT: int = 16      # 全局并发连接上限
 MAX_PER_IP: int = 4           # 单 IP 并发连接上限（防单点占满）
 AUTH_FAIL_LIMIT: int = 5      # 每 IP 认证失败上限
 AUTH_FAIL_WINDOW: int = 300   # 锁定窗口（秒）
+
+# BUG-270 防护：新连接速率限制（防 IPv6 轮换地址刷配对/刷失败计数）
+CONN_RATE_LIMIT: int = 10     # 每 IP 每秒最多新建连接数
+CONN_RATE_WINDOW: float = 1.0 # 速率窗口（秒）
+
+# BUG-269 防护：连接/握手超时从 300s 收紧到 60s（防 slowloris 占满全局并发槽）
+CONN_TIMEOUT: float = 60.0
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -379,6 +412,32 @@ class IPRateLimiter:
             self._fail_count.pop(ip, None)
 
 
+class IPConnRateLimiter:
+    """per-IP 新建连接速率限制（滑动窗口）。
+
+    BUG-270: 抵御 IPv6 地址轮换绕过 —— 攻击者换地址可绕过 per-IP 并发上限
+    与认证失败锁定，但无论地址怎么换，短时间内新建连接太多就会被拒。
+    """
+
+    def __init__(self, limit: int = CONN_RATE_LIMIT, window: float = CONN_RATE_WINDOW):
+        self.limit = limit
+        self.window = window
+        self._timestamps: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, ip: str) -> bool:
+        """是否允许该 IP 新建连接；允许则记录本次连接时间戳。"""
+        with self._lock:
+            now = time.time()
+            stamps = [t for t in self._timestamps.get(ip, []) if now - t <= self.window]
+            if len(stamps) >= self.limit:
+                self._timestamps[ip] = stamps
+                return False
+            stamps.append(now)
+            self._timestamps[ip] = stamps
+            return True
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 路径安全
 # ─────────────────────────────────────────────────────────────────────
@@ -489,7 +548,10 @@ class DriveServer:
         
         # per-IP 认证失败限流（防暴力破解，共享逻辑见 IPRateLimiter）
         self._fail_limiter = IPRateLimiter(self.AUTH_FAIL_LIMIT, self.AUTH_FAIL_WINDOW)
-        
+
+        # BUG-270: per-IP 新建连接速率限制（防 IPv6 轮换地址绕过）
+        self._conn_limiter = IPConnRateLimiter(CONN_RATE_LIMIT, CONN_RATE_WINDOW)
+
         self._servers: list[socket.socket] = []  # 所有监听 socket（IPv4 + IPv6）
     
     # ── 主循环 ──
@@ -547,7 +609,13 @@ class DriveServer:
     def _accept_connection(self, conn: socket.socket, addr: tuple) -> None:
         """接受新连接，检查并发限制。"""
         ip = addr[0]
-        
+
+        # BUG-270: 新建连接速率限制（IPv6 轮换地址无法绕过）
+        if not self._conn_limiter.allow(ip):
+            conn.close()
+            self.log.warning(f"连接速率超限（{CONN_RATE_LIMIT}/秒），拒绝 {ip}")
+            return
+
         with self._conn_lock:
             if self._conn_count >= self.MAX_CONCURRENT:
                 conn.close()
@@ -588,7 +656,8 @@ class DriveServer:
     
     def handle(self, conn: socket.socket, addr: tuple) -> None:
         """处理单个连接。支持会话保持：认证后由 _command_loop 持续处理指令。"""
-        conn.settimeout(300)
+        # BUG-269: 300s → CONN_TIMEOUT(60s)，防慢速连接长占并发槽 (slowloris)
+        conn.settimeout(CONN_TIMEOUT)
         
         try:
             while True:
@@ -1148,40 +1217,116 @@ def udp_discovery(udp_port: int, tcp_port: int, logger: logging.Logger) -> None:
 # 主入口
 # ─────────────────────────────────────────────────────────────────────
 
+def _generate_qr_code(content: str, save_path: Path) -> bool:
+    """生成连接二维码 PNG（内容如 PTDRIVE|ip|port|pairCode）。
+    
+    优先用 qrcode 库；失败时尝试 PIL 手绘简易二维码；都失败返回 False。
+    返回是否成功生成。
+    """
+    try:
+        import qrcode
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=10,
+            border=2,
+        )
+        qr.add_data(content)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(str(save_path))
+        return True
+    except Exception:
+        pass
+    # 降级：PIL 手绘简单二维码（数据量小时可用）
+    try:
+        import qrcode
+        qr = qrcode.QRCode(box_size=10, border=2)
+        qr.add_data(content)
+        qr.make()
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        qr.make_image().save(str(save_path))
+        return True
+    except Exception:
+        return False
+
+
+def _print_ascii_qr(content: str) -> None:
+    """在终端打印 ASCII 二维码（用半块字符，手机可扫码）。"""
+    try:
+        import qrcode
+        qr = qrcode.QRCode(box_size=1, border=1)
+        qr.add_data(content)
+        qr.make()
+        matrix = qr.get_matrix()
+        for row in matrix:
+            print("".join("██" if c else "  " for c in row))
+    except Exception:
+        pass
+
+
 def _print_startup_banner(root: Path, port: int, pair: str,
                           ipv6_addr: str | None, lan_ips: list[str],
-                          admin_code: str | None = None) -> None:
-    """打印清晰的启动面板（用 print，直观无日志前缀）。"""
-    line = "=" * 62
+                          admin_code: str | None = None,
+                          qr_files: list[str] | None = None) -> None:
+    """打印清晰的启动面板（用 print，直观无日志前缀）。
+    
+    极简风格：分成「手机连接」「网盘信息」两个区块，每块标题一行、
+    内容左对齐，一眼看到手机端要填什么。
+    """
     used = human_size(get_dir_size(root))
-    parts = [
-        "",
-        line,
-        "  PhotoTrans 网盘已就绪",
-        line,
-        f"  网盘目录   : {root}",
-        f"  已用空间   : {used}",
-    ]
+    W = 58  # 面板宽度（内容区）
+    line = "=" * W
+
+    rows: list[str] = [""]
+
+    # ── 标题 ──
+    rows.append("=" * W)
+    rows.append("  PhotoTrans 网盘 · 运行中")
+    rows.append("=" * W)
+    rows.append("")
+
+    # ── 区块1: 手机连接 ──
+    rows.append(line)
+    rows.append("  [1] 手机连接")
+    rows.append(line)
     if lan_ips:
-        parts.append(f"  局域网地址 : {', '.join(f'{ip}:{port}' for ip in lan_ips)}")
-        parts.append("               ↑ 手机填这个地址（需与电脑同一 WiFi）")
+        # 只显示第一个 IPv4（最常用），其余折叠
+        primary = lan_ips[0]
+        rows.append(f"  局域网  : {primary}:{port}")
+        if len(lan_ips) > 1:
+            rows.append(f"           (其他: {', '.join(f'{ip}:{port}' for ip in lan_ips[1:])})")
     else:
-        parts.append("  局域网地址 : 未检测到（请确认已连接 WiFi）")
-    parts.append(f"  普通配对码 : {pair}（只读：仅浏览/下载）")
-    if admin_code:
-        parts.append(f"  管理员配对码: {admin_code}（完整权限：上传/删除）")
+        rows.append("  局域网  : 未检测到（请确认已连接 WiFi）")
     if ipv6_addr:
-        parts.append(f"  IPv6 地址  : [{ipv6_addr}]:{port}（异地连接用）")
-    parts.extend([
-        "-" * 62,
-        "  手机端操作：打开 PhotoTrans → 添加电脑",
-        "            → 输入上方「局域网地址」和「配对码」",
-        "  只读设备只能下载，上传/删除请用管理员配对码",
-        "  停止服务  ：按 Ctrl+C",
-        line,
-        "",
-    ])
-    print("\n".join(parts))
+        rows.append(f"  远程    : [{ipv6_addr}]:{port}")
+    rows.append("")
+    rows.append(f"  配对码  : {pair}   (只读 · 浏览/下载)")
+    if admin_code:
+        rows.append(f"           {admin_code}  (完整 · 上传/删除)")
+    rows.append("")
+    rows.append("  ⚠ 配对码为明文 6 位数字，仅限可信网络使用；")
+    rows.append("    请勿在公共 Wi-Fi / 公网 IPv6 上运行。")
+    rows.append("")
+
+    # ── 区块2: 网盘信息 ──
+    rows.append(line)
+    rows.append("  [2] 网盘信息")
+    rows.append(line)
+    rows.append(f"  目录    : {root}")
+    rows.append(f"  已用    : {used}")
+
+    # ── 区块3: 二维码文件（若已生成）──
+    if qr_files:
+        rows.append("")
+        rows.append(line)
+        rows.append("  [3] 二维码文件（手机可保存/传输此图再扫）")
+        rows.append(line)
+        for qf in qr_files:
+            rows.append(f"  · {qf}")
+
+    print("\n".join(rows))
 
 
 def _permission_label(permission: str) -> str:
@@ -1193,29 +1338,36 @@ def _show_status(root: Path, port: int, pair: str, auth: AuthStore,
                  admin_code: str | None = None) -> None:
     """显示配置摘要 + 设备 + 磁盘占用（--status 命令），然后退出。"""
     devices = auth.list_devices()
-    line = "=" * 56
-    print()
-    print(line)
-    print("  PhotoTrans 网盘状态")
-    print(line)
-    print(f"  网盘目录 : {root}")
-    print(f"  监听端口 : {port}")
-    print(f"  普通配对码 : {pair}（只读）")
+    used = human_size(get_dir_size(root))
+    W = 56
+    line = "=" * W
+    rows = [""]
+    rows.append("=" * W)
+    rows.append("  PhotoTrans 网盘 · 状态")
+    rows.append("=" * W)
+    rows.append("")
+    rows.append(line)
+    rows.append("  [1] 配置")
+    rows.append(line)
+    rows.append(f"  目录    : {root}")
+    rows.append(f"  端口    : {port}")
+    rows.append(f"  已用    : {used}")
+    rows.append(f"  配对码  : {pair}   (只读)")
     if admin_code:
-        print(f"  管理员配对码: {admin_code}（完整）")
-    print(f"  已用空间 : {human_size(get_dir_size(root))}")
-    print(f"  已绑设备 : {len(devices)} 台")
-    print("-" * 56)
+        rows.append(f"           {admin_code}  (完整)")
+    rows.append("")
+    rows.append(line)
+    rows.append(f"  [2] 已绑设备 · {len(devices)} 台")
+    rows.append(line)
     if not devices:
-        print("  （暂无绑定设备，启动后手机连接即可绑定）")
+        rows.append("  （暂无，手机连接后自动绑定）")
     else:
         for d in devices:
             perm = _permission_label(d["permission"])
-            print(f"  · {d['device_name']}（{perm}权限）")
-            print(f"      ID: {d['device_id']}")
-            print(f"      绑定: {d['paired_at'][:19]}")
-    print(line)
-    print()
+            rows.append(f"  · {d['device_name']}（{perm}）")
+            rows.append(f"      ID: {d['device_id']} · {d['paired_at'][:19]}")
+    rows.append("")
+    print("\n".join(rows))
 
 
 def _handle_device_management(meta_dir: Path, args) -> None:
@@ -1224,18 +1376,27 @@ def _handle_device_management(meta_dir: Path, args) -> None:
 
     if args.list_devices:
         devices = auth.list_devices()
+        W = 56
+        line = "=" * W
+        rows = [""]
+        rows.append("=" * W)
+        rows.append(f"  PhotoTrans 网盘 · 已绑设备 ({len(devices)} 台)")
+        rows.append("=" * W)
         if not devices:
-            print("暂无已绑定设备。")
-            print("启动服务后，手机用配对码连接即可自动绑定。")
+            rows.append("  暂无绑定设备")
+            rows.append("  启动服务后，手机用配对码连接即可自动绑定")
         else:
-            print(f"已绑定设备（共 {len(devices)} 台）：")
-            print()
             for d in devices:
                 perm = _permission_label(d["permission"])
-                print(f"  · {d['device_name']}（{perm}权限）")
-                print(f"      ID: {d['device_id']}")
-                print(f"      绑定时间: {d['paired_at']}")
-                print()
+                rows.append("")
+                rows.append(f"  · {d['device_name']}  ({perm}权限)")
+                rows.append(f"    ID: {d['device_id']}")
+                rows.append(f"    绑定: {d['paired_at']}")
+        rows.append("")
+        rows.append("=" * W)
+        rows.append("  解绑: python server.py --remove-device <设备ID>")
+        rows.append("")
+        print("\n".join(rows))
 
     if args.remove_device:
         if auth.remove_device(args.remove_device):
@@ -1338,7 +1499,7 @@ def main() -> None:
     meta_dir = Path.home() / ".phototransdrive"
     root = Path(args.root)
     auth = AuthStore(meta_dir / "devices.json")
-    
+
     # ── 设备管理命令（不需要配对码，执行后退出）──
     if args.list_devices or args.remove_device:
         _handle_device_management(meta_dir, args)
@@ -1384,6 +1545,15 @@ def main() -> None:
     root.mkdir(parents=True, exist_ok=True)
     
     logger = setup_logger(meta_dir)
+
+    # BUG-268 清理：删除历史遗留在网盘根目录的二维码 PNG
+    # （旧版本把含管理码的 PNG 写在 root 下，只读设备可下载提权；升级后清除）
+    for legacy_qr in root.glob("连接二维码_*.png"):
+        try:
+            legacy_qr.unlink(missing_ok=True)
+            logger.info(f"已删除历史二维码文件：{legacy_qr.name}（已迁移到安全目录）")
+        except Exception as e:
+            logger.warning(f"删除历史二维码失败：{legacy_qr.name}: {e}")
     
     # 端口占用检测：提前给出友好提示，而不是让底层 bind 抛堆栈
     ok, err = check_port_available(args.port)
@@ -1419,8 +1589,42 @@ def main() -> None:
     )
     udp_thread.start()
     
+    # ── 生成连接二维码（手机扫码自动填 IP/端口/配对码）──
+    # BUG-268 修复：二维码内容只用「只读配对码 pair」，绝不再携带 admin_code。
+    # 同时 PNG 保存到 meta_dir（~/.phototransdrive，网盘共享范围之外）：
+    # 之前存 root 下会被只读设备直接下载 PNG 拿到管理码 → 权限提升。
+    lan_ips = get_lan_ipv4_addresses()
+    qr_contents: list[str] = []
+    if lan_ips:
+        qr_contents.append(("局域网", f"PTDRIVE|{lan_ips[0]}|{args.port}|{pair}"))
+    if ipv6_addr:
+        qr_contents.append(("远程", f"PTDRIVE|{ipv6_addr}|{args.port}|{pair}"))
+    qr_saved: list[str] = []
+    qr_dir = meta_dir
+    try:
+        qr_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    for label, qc in qr_contents:
+        qr_name = f"连接二维码_{label}.png"
+        qr_path = qr_dir / qr_name
+        if _generate_qr_code(qc, qr_path):
+            qr_saved.append(f"{label}: {qr_path}")
+
     # 打印清晰的启动面板（手机端怎么连，一目了然）
-    _print_startup_banner(root, args.port, pair, ipv6_addr, get_lan_ipv4_addresses(), admin_code=admin_code)
+    _print_startup_banner(root, args.port, pair, ipv6_addr, lan_ips,
+                          admin_code=admin_code, qr_files=qr_saved)
+
+    # 终端 ASCII 二维码（方便直接对着屏幕扫）
+    if qr_contents:
+        print("")
+        print("=" * 58)
+        print("  [3] 手机扫码连接（对着屏幕扫下面的二维码）")
+        print("=" * 58)
+        for label, qc in qr_contents:
+            print(f"  [{label}] 内容: {qc}")
+            _print_ascii_qr(qc)
+        print("")
     
     # --open：在文件管理器中打开网盘目录（传完文件直接看）
     if args.open:

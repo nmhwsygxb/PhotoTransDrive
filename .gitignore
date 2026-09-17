@@ -22,3 +22,6 @@ dist/
 # 涓存椂
 *.tmp
 .testtmp/
+# 服务运行错误输出
+*.err
+*.out
