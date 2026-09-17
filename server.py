@@ -39,6 +39,17 @@ PhotoTrans 网盘 · 电脑端服务端
 
 from __future__ import annotations
 
+# BUG-264 修复: 强制 stdout/stderr 使用 UTF-8 输出。
+# Windows 默认控制台代码页是 GBK(936)，Python print 中文启动面板/日志
+# 会抛 UnicodeEncodeError 崩溃；此配置让输出始终 UTF-8，配合 bat 中 chcp 65001 正常显示。
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception: pass
+if hasattr(sys.stderr, "reconfigure"):
+    try: sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception: pass
+
 import argparse
 import json
 import logging
