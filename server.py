@@ -1467,6 +1467,13 @@ def main() -> None:
     )
     
     parser.add_argument(
+        "--udp-port",
+        type=int,
+        default=int(cfg.get("udp_port", DEFAULT_UDP_PORT)),
+        help=f"UDP 发现端口（默认 {DEFAULT_UDP_PORT}；手机'自动查找电脑'用）"
+    )
+    
+    parser.add_argument(
         "--pair-code",
         default=cfg.get("pair_code"),
         help="普通配对码（只读权限：仅浏览/下载；默认自动生成并保存，重启不变）"
@@ -1580,7 +1587,7 @@ def main() -> None:
     # 启动日志
     logger.info("=" * 60)
     logger.info(f"网盘根目录：{root}")
-    logger.info(f"监听端口：{args.port}（UDP 发现端口 {DEFAULT_UDP_PORT}）")
+    logger.info(f"监听端口：{args.port}（UDP 发现端口 {args.udp_port}）")
     logger.info(f"普通配对码（只读）：{pair}")
     logger.info(f"管理员配对码（完整）：{admin_code}")
     if ipv6_addr:
@@ -1595,7 +1602,7 @@ def main() -> None:
     # UDP 发现：手机广播查询时回复自己的 IP+端口（免手输 IP）
     udp_thread = threading.Thread(
         target=udp_discovery,
-        args=(DEFAULT_UDP_PORT, args.port, logger),
+        args=(args.udp_port, args.port, logger),
         daemon=True
     )
     udp_thread.start()
