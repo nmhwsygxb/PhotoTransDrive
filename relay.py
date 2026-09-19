@@ -77,6 +77,9 @@ AUTH_FAIL_WINDOW = 300          # 锁定窗口 (秒)
 KEEPALIVE_TIMEOUT = 60.0        # 控制连接 recv 超时 (秒)
 KEEPALIVE_STALE_LIMIT = 5       # 连续超时次数 → 判定死连注销 (约 5 分钟无心跳)
 MAX_PHONE_CONNS = 256           # 数据端口并发手机连接上限 (防线程耗尽 DoS)
+REUSE_WAIT = 3.0                # 手机连接时隧道不可用, 排队等待最长秒数
+                                # (App 每次操作独立连接, 操作间中继需重建隧道,
+                                #  排队等待避免快速操作撞上重建窗口而失败)
 
 
 def setup_logger() -> logging.Logger:
@@ -192,7 +195,9 @@ class RelayServer:
                                 "peer": peer, "registered_at": time.time()}
             self._port_map[data_port] = name
         if close_sock is not None:
-            try: close_sock.close()
+            try:
+                close_sock.close()
+                self.log.debug(f"[_register] 关闭替换掉的旧隧道: {name}")
             except Exception: pass
 
     def _unregister(self, name: str, ctrl_conn: socket.socket | None = None) -> None:
@@ -213,7 +218,9 @@ class RelayServer:
             if t and not t.get("taken"):
                 close_sock = t["tun_sock"]
         if close_sock is not None:
-            try: close_sock.close()
+            try:
+                close_sock.close()
+                self.log.debug(f"[_unregister] 关闭注销的隧道: {name}")
             except Exception: pass
 
     def list_tunnels(self) -> list[dict]:
@@ -335,7 +342,11 @@ class RelayServer:
 
     # ── 数据连接 ──
     def _dispatch_data(self, conn: socket.socket, addr, data_port: int) -> None:
-        """数据端口连接: 读首行区分 电脑隧道 vs 手机。"""
+        """数据端口连接: 读首行区分 电脑隧道 vs 手机。
+        重要: 隧道连接 (PT-RELAY-TUNNEL) 返回后【不关闭 conn】—— 隧道 socket
+        的生命周期由 _phone_connect/_unregister/替换逻辑管理; 若此处 close,
+        手机会话进行中 (_tunnel_establish 等待循环被接管唤醒返回) 会被误关
+        (WinError 10038)。手机连接才由本函数 finally 关闭。"""
         ip = addr[0]
         conn.settimeout(REG_TIMEOUT)
         try:
@@ -347,25 +358,35 @@ class RelayServer:
                 buf += chunk
                 if len(buf) > 4096:
                     return
-            line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
-            parts = line.split(" ")
-            if len(parts) == 2 and parts[0] == "PT-RELAY-TUNNEL":
-                name = parts[1]
-                self._tunnel_establish(conn, data_port, name, ip)
-            else:
-                self._phone_connect(conn, data_port, buf, ip)
         except Exception as e:
-            self.log.warning(f"数据连接异常: {ip}@{data_port}: {e}")
-        finally:
+            self.log.warning(f"数据连接读首行异常: {ip}@{data_port}: {e}")
             try: conn.close()
             except Exception: pass
+            return
+        line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
+        parts = line.split(" ")
+        if len(parts) == 2 and parts[0] == "PT-RELAY-TUNNEL":
+            name = parts[1]
+            # 隧道连接: 所有权移交给隧道管理, 本线程不 close
+            self._tunnel_establish(conn, data_port, name, ip)
+        else:
+            try:
+                self._phone_connect(conn, data_port, buf, ip)
+            except Exception as e:
+                self.log.warning(f"手机连接异常: {ip}@{data_port}: {e}")
+            finally:
+                try: conn.close()
+                except Exception: pass
 
     def _tunnel_establish(self, conn: socket.socket, data_port: int, name: str, ip: str) -> None:
         """电脑建立隧道: 校验注册存在、端口匹配、且来源 IP 与注册时一致。
+        来源 IP 校验防止攻击者连数据端口发 PT-RELAY-TUNNEL 顶替电脑隧道。
 
-        来源 IP 校验防止攻击者连数据端口发 PT-RELAY-TUNNEL 顶替电脑隧道
-        (TCP 无法伪造源 IP, 三次握手需要真实回包)。relay_client 重连时
-        会重新注册 (更新 peer), 故动态 IP 场景自动放行。
+        建立后【立即返回, 不持有线程】: 隧道 socket 所有权移交隧道管理。
+          生命周期:
+            - 手机连接 → _phone_connect 接管转发 → 结束 close+pop
+            - 电脑重连 → 本函数替换 (close 旧隧道)
+            - 电脑掉线 → _unregister close
         """
         with self._lock:
             reg = self._regs.get(name)
@@ -380,50 +401,42 @@ class RelayServer:
                 return
             old_t = self._tunnels.get(data_port)
         if old_t and old_t["tun_sock"] is not conn:
-            try: old_t["tun_sock"].close()
+            # 替换旧隧道: 若旧隧道正被手机使用 (taken), close 会让该会话中断,
+            # 但旧隧道本就来自已断开/重建的 relay_client, 对端已 EOF, 关闭无副作用
+            try:
+                old_t["tun_sock"].close()
+                self.log.debug(f"[_tunnel_establish] 替换关闭旧隧道: {name}@{data_port}")
             except Exception: pass
         with self._lock:
             self._tunnels[data_port] = {"tun_sock": conn, "peer": ip,
                                         "ready_at": time.time(), "taken": False}
         self._send_line(conn, "PT-RELAY-OK tunnel-ready")
         self.log.info(f"隧道就绪: {name}@{data_port} <- {ip}")
-        # 等待被接管/清除/替换 (不 recv 隧道数据, 避免与手机接管线程抢读)
-        try:
-            while not self._stop.is_set():
-                time.sleep(0.3)
-                with self._lock:
-                    t = self._tunnels.get(data_port)
-                    if t is None or t["tun_sock"] is not conn:
-                        return
-                    if t.get("taken"):
-                        return
-        finally:
-            # 若尚未被手机接管且仍持有本隧道, 则清除
-            with self._lock:
-                t = self._tunnels.get(data_port)
-                if t and t["tun_sock"] is conn and not t.get("taken"):
-                    self._tunnels.pop(data_port, None)
+        # 返回, 不持有线程; conn 不在此关闭 (由隧道管理逻辑负责)
 
     def _phone_connect(self, phone_sock: socket.socket, data_port: int, first_chunk: bytes, ip: str) -> None:
         """手机连接: 找隧道并全权接管做双向转发。
 
-        生命周期约定:
-          - 手机连接到来时, 隧道必须存在且未被占用 (taken=False)。
-          - 接管后标记 taken=True, 隧道线程 (_tunnel_establish) 随即退出。
-          - 手机会话结束 (relay 返回): 关闭隧道 socket, 通知 relay_client 重建。
-          - 不直接 pop _tunnels —— 由 relay_client 重新注册时替换;
-            若 relay_client 未及时重建, 端口保持"无隧道" (taken=True, sock 已关),
-            新手机连接会得到 no-tunnel 并重试 (App 有重连机制)。
+        因为 App 每次操作都新建连接, 而中继每手机会话结束后会关闭隧道
+        通知 relay_client 重建, 操作之间可能存在短暂的隧道真空期。
+        这里【排队等待最多 REUSE_WAIT 秒】: 若隧道正被占用 (taken)
+        或重建中 (条目缺失), 轮询等待其就绪, 而非立即 no-tunnel。
         """
-        with self._lock:
-            t = self._tunnels.get(data_port)
-            name = self._port_map.get(data_port)
-            if not t or not name or t.get("taken"):
-                t = None
-            else:
-                t["taken"] = True  # 原子接管, 隧道线程随后退出
-        if not t:
-            self.log.warning(f"手机连接无可用隧道: {ip}@{data_port}")
+        t = None
+        name = None
+        wait_deadline = time.time() + REUSE_WAIT
+        while True:
+            with self._lock:
+                t = self._tunnels.get(data_port)
+                name = self._port_map.get(data_port)
+                if t and name and not t.get("taken"):
+                    t["taken"] = True  # 原子接管
+                    break
+            if time.time() >= wait_deadline:
+                break
+            time.sleep(0.1)
+        if not t or not name:
+            self.log.warning(f"手机连接无可用隧道: {ip}@{data_port} (等待 {REUSE_WAIT}s 后仍不可用)")
             try: phone_sock.sendall(b"PT-RELAY-FAIL no-tunnel\n")
             except Exception: pass
             return
@@ -433,7 +446,11 @@ class RelayServer:
         # 手机会话结束: 关闭隧道, 通知 relay_client 重建
         try: tun_sock.close()
         except Exception: pass
-        # 保留 taken=True 的条目 (端口仍映射到 name), relay_client 重建时替换
+        # 清理隧道条目 (已结束, 无复用价值 — relay_client 会重建新隧道)
+        with self._lock:
+            cur = self._tunnels.get(data_port)
+            if cur is t:
+                self._tunnels.pop(data_port, None)
 
     def _relay(self, a: socket.socket, b: socket.socket, a_first: bytes, name: str, phone_ip: str) -> None:
         """双向盲转发 a <-> b。"""
@@ -467,6 +484,7 @@ class RelayServer:
                     target = b if s is a else a
                     target.sendall(data)
                     sent += len(data)
+                    self.log.debug(f"转发: {'手机→隧道' if s is a else '隧道→手机'} +{len(data)}B (共 {sent}B)")
         except (ConnectionError, OSError) as e:
             self.log.warning(f"转发异常: {name}: {e}")
         finally:
