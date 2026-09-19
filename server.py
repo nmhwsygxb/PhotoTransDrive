@@ -1127,6 +1127,126 @@ def save_config(config_path: Path, cfg: dict) -> bool:
         return False
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 邮件通知（BUG-281: 外部访问方案二 —— 邮箱传递连接信息）
+# ─────────────────────────────────────────────────────────────────────
+
+def guess_smtp_server(email: str) -> str:
+    """根据收件邮箱域名猜测 SMTP 服务器 (QQ/163/Gmail/Outlook/126/新浪)。"""
+    e = email.lower()
+    if "qq.com" in e:
+        return "smtp.qq.com"
+    if "163.com" in e:
+        return "smtp.163.com"
+    if "126.com" in e:
+        return "smtp.126.com"
+    if "gmail.com" in e:
+        return "smtp.gmail.com"
+    if "outlook.com" in e or "hotmail.com" in e or "live.com" in e:
+        return "smtp.office365.com"
+    if "sina.com" in e:
+        return "smtp.sina.com"
+    if "139.com" in e:
+        return "smtp.139.com"
+    return "smtp." + e.split("@")[-1]
+
+
+def guess_smtp_port(server: str, use_ssl: bool = True) -> int:
+    """SMTP 端口猜测: SSL=465, STARTTLS=587; Gmail/Outlook 走 587。"""
+    s = server.lower()
+    if use_ssl and not (("gmail" in s) or ("office365" in s) or ("outlook" in s)):
+        return 465
+    return 587
+
+
+def send_connection_email(
+    to_addr: str,
+    auth_code: str,
+    smtp_user: str,
+    smtp_server: str,
+    smtp_port: int,
+    ipv6_addr: str | None,
+    lan_ips: list[str],
+    port: int,
+    pair_code: str,
+    admin_code: str | None = None,
+    logger: Optional[logging.Logger] = None,
+) -> tuple[bool, str]:
+    """发送网盘连接信息邮件（App 邮件模式可自动解析）。
+
+    正文含 `PTDRIVE|<ip>|<port>|<pairCode>` 行, 手机端 DriveMailFetcher 可识别。
+    返回 (是否成功, 错误信息)。
+    """
+    if not to_addr or not auth_code:
+        return False, "未配置收件邮箱或授权码"
+    if not smtp_server:
+        smtp_server = guess_smtp_server(to_addr)
+    if not smtp_port:
+        smtp_port = guess_smtp_port(smtp_server)
+    # SMTP 登录用户默认与收件邮箱一致 (QQ/163 需用授权码登录, 用户名=邮箱)
+    if not smtp_user:
+        smtp_user = to_addr
+
+    log = logger or logging.getLogger("phototrans_drive")
+
+    # 组装连接信息
+    lines = ["PhotoTrans 网盘 · 连接信息", ""]
+    # IPv6 优先 (异地可用), 其次局域网 IPv4
+    if ipv6_addr:
+        lines.append(f"PTDRIVE|{ipv6_addr}|{port}|{pair_code}")
+    elif lan_ips:
+        lines.append(f"PTDRIVE|{lan_ips[0]}|{port}|{pair_code}")
+    else:
+        lines.append(f"PTDRIVE|127.0.0.1|{port}|{pair_code}")
+    lines.append("")
+    lines.append("请在 PhotoTrans App → 网盘 → 邮件模式 中填写收件邮箱与授权码,")
+    lines.append("App 会自动读取本邮件并填入连接信息。")
+    lines.append("")
+    if ipv6_addr:
+        lines.append(f"远程地址: [{ipv6_addr}]:{port}  (公网 IPv6, 需手机所在网络支持 IPv6)")
+    if lan_ips:
+        lines.append(f"局域网地址: {', '.join(f'{ip}:{port}' for ip in lan_ips)}")
+    lines.append(f"配对码: {pair_code} (只读权限)")
+    if admin_code:
+        lines.append(f"管理员码: {admin_code} (完整权限)")
+    lines.append("")
+    lines.append(f"发送时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    body = "\n".join(lines)
+    try:
+        import smtplib
+        from email.header import Header
+        from email.mime.text import MIMEText
+
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = Header("PTDRIVE 网盘连接信息", "utf-8")
+        msg["From"] = smtp_user
+        msg["To"] = to_addr
+
+        # SSL 465 优先, 失败回退 STARTTLS 587
+        last_err: str = ""
+        for ssl_use in (True, False) if smtp_port in (0, None) else ((smtp_port == 465),):
+            try:
+                if ssl_use:
+                    s = smtplib.SMTP_SSL(smtp_server, 465, timeout=20)
+                else:
+                    s = smtplib.SMTP(smtp_server, 587, timeout=20)
+                    s.starttls()
+                s.login(smtp_user, auth_code)
+                s.sendmail(smtp_user, [to_addr], msg.as_string())
+                s.quit()
+                log.info(f"连接信息邮件已发送到 {to_addr}")
+                return True, ""
+            except Exception as e:
+                last_err = str(e)
+                log.warning(f"邮件发送尝试失败 ({'SSL465' if ssl_use else 'STARTTLS587'}): {e}")
+        return False, last_err
+    except Exception as e:
+        log.error(f"邮件发送异常: {e}")
+        return False, str(e)
+
+
+
 def check_port_available(port: int) -> tuple[bool, str]:
     """检查 TCP 端口是否可监听。返回 (可用, 错误说明)。
 
@@ -1485,6 +1605,38 @@ def main() -> None:
         help="管理员配对码（完整权限：上传/删除/改动；默认自动生成并保存）"
     )
     
+    # ── 邮件通知（BUG-281: 外部访问方案二）──
+    parser.add_argument(
+        "--email-to",
+        default=cfg.get("email_to", ""),
+        help="收件邮箱（配置后启动时自动把 IPv6+配对码 发到该邮箱，手机 App 邮件模式可读取）"
+    )
+    
+    parser.add_argument(
+        "--email-auth",
+        default=cfg.get("email_auth", ""),
+        help="发件邮箱授权码（SMTP 授权码，非登录密码；QQ 邮箱在 设置→账号→开启 SMTP 获取）"
+    )
+    
+    parser.add_argument(
+        "--email-user",
+        default=cfg.get("email_user", ""),
+        help="SMTP 登录用户名（默认=收件邮箱；多数邮箱用授权码登录时用户名就是邮箱地址）"
+    )
+    
+    parser.add_argument(
+        "--email-server",
+        default=cfg.get("email_server", ""),
+        help="SMTP 服务器（留空自动: qq→smtp.qq.com, 163→smtp.163.com, gmail→smtp.gmail.com）"
+    )
+    
+    parser.add_argument(
+        "--email-port",
+        type=int,
+        default=int(cfg.get("email_port", 0) or 0),
+        help="SMTP 端口（留空自动: 465 SSL, 失败回退 587 STARTTLS）"
+    )
+    
     # 设备管理命令（执行后退出，不启动服务）
     parser.add_argument(
         "--list-devices",
@@ -1559,6 +1711,19 @@ def main() -> None:
         _show_status(root, args.port, pair, auth, admin_code=admin_code)
         return
     
+    # ── 邮件通知配置（BUG-281: 保存并启动时发送连接信息）──
+    email_to = (args.email_to or "").strip()
+    email_auth = (args.email_auth or "").strip()
+    if email_to or email_auth:
+        # 持久化邮箱配置，重启后自动沿用
+        save_config(config_path, {
+            "email_to": email_to,
+            "email_auth": email_auth,
+            "email_user": (args.email_user or "").strip(),
+            "email_server": (args.email_server or "").strip(),
+            "email_port": int(args.email_port or 0),
+        })
+    
     # ── 启动服务 ──
     root.mkdir(parents=True, exist_ok=True)
     
@@ -1612,6 +1777,27 @@ def main() -> None:
     # 同时 PNG 保存到 meta_dir（~/.phototransdrive，网盘共享范围之外）：
     # 之前存 root 下会被只读设备直接下载 PNG 拿到管理码 → 权限提升。
     lan_ips = get_lan_ipv4_addresses()
+    
+    # ── 邮件通知（BUG-281）: 配置了收件邮箱则启动时自动发送连接信息 ──
+    if email_to:
+        ok, err = send_connection_email(
+            to_addr=email_to,
+            auth_code=email_auth,
+            smtp_user=(args.email_user or "").strip(),
+            smtp_server=(args.email_server or "").strip(),
+            smtp_port=int(args.email_port or 0),
+            ipv6_addr=ipv6_addr,
+            lan_ips=lan_ips,
+            port=args.port,
+            pair_code=pair,
+            admin_code=admin_code,
+            logger=logger,
+        )
+        if ok:
+            logger.info("启动邮件通知已发送（手机 App 邮件模式可读取连接信息）")
+        else:
+            logger.warning(f"启动邮件通知发送失败: {err}")
+    
     qr_contents: list[str] = []
     if lan_ips:
         qr_contents.append(("局域网", f"PTDRIVE|{lan_ips[0]}|{args.port}|{pair}"))
