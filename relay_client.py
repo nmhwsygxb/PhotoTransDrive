@@ -32,6 +32,7 @@ import os
 import select
 import socket
 import sys
+import threading
 import time
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -43,7 +44,9 @@ if hasattr(sys.stderr, "reconfigure"):
 
 BUF_SIZE = 65536
 CTRL_TIMEOUT = 30.0
-IDLE_TIMEOUT = 7200.0
+IDLE_TIMEOUT = 300.0           # 桥接 select 空闲超时 (秒): 超时重建隧道, 刷新 NAT 映射
+HEARTBEAT_INTERVAL = 20.0      # 控制连接心跳间隔 (秒): 保持 NAT 映射活跃
+HEARTBEAT_STALE_LIMIT = 6      # 连续心跳失败次数 → 判定中继链路死亡, 强制重连
 
 
 def setup_logger() -> logging.Logger:
@@ -143,6 +146,11 @@ def run_client(relay_host: str, relay_ctrl_port: int, auth_key: str,
 
     while True:
         data_port: int | None = None
+        ctrl: socket.socket | None = None
+        tun: socket.socket | None = None
+        hb_stop = threading.Event()
+        hb_failed = [0]
+        hb_thread: threading.Thread | None = None
         try:
             # 1) 注册
             logger.info("连接中继注册...")
@@ -151,7 +159,6 @@ def run_client(relay_host: str, relay_ctrl_port: int, auth_key: str,
             resp = recv_line(ctrl, CTRL_TIMEOUT)
             if not resp.startswith("PT-RELAY-OK "):
                 logger.error(f"注册失败: {resp}")
-                ctrl.close()
                 time.sleep(retry)
                 continue
             data_port = int(resp.split(" ")[1])
@@ -163,19 +170,35 @@ def run_client(relay_host: str, relay_ctrl_port: int, auth_key: str,
             tresp = recv_line(tun, CTRL_TIMEOUT)
             if not tresp.startswith("PT-RELAY-OK"):
                 logger.error(f"隧道建立失败: {tresp}")
-                tun.close()
-                ctrl.close()
                 time.sleep(retry)
                 continue
             logger.info(f"隧道就绪: {relay_host}:{data_port}")
-            # 保持控制连接 (中继需要它存活)
-            ctrl.settimeout(60.0)
 
-            # 3) 隧道就绪后, 等待手机数据: 桥接隧道 <-> 本地 server.py
+            # 3) 心跳线程: 每 HEARTBEAT_INTERVAL 向控制连接发 PING, 保持 NAT 映射
+            #    连续失败 HEARTBEAT_STALE_LIMIT 次 → 判定中继链路死亡, 触发重建
+            def _heartbeat(ctrl_sock: socket.socket, fail_cnt: list[int],
+                           stop: threading.Event, log: logging.Logger) -> None:
+                while not stop.is_set():
+                    if stop.wait(HEARTBEAT_INTERVAL):
+                        break
+                    try:
+                        ctrl_sock.sendall(b"PT-RELAY-PING\n")
+                        fail_cnt[0] = 0
+                    except OSError:
+                        fail_cnt[0] += 1
+                        log.warning(f"心跳发送失败 ({fail_cnt[0]}): {name}")
+                        if fail_cnt[0] >= HEARTBEAT_STALE_LIMIT:
+                            return  # 链路死亡, 主循环的 recv 会察觉并重建
+
+            hb_thread = threading.Thread(
+                target=_heartbeat, args=(ctrl, hb_failed, hb_stop, logger),
+                daemon=True)
+            hb_thread.start()
+
+            # 4) 隧道就绪后, 等待手机数据: 桥接隧道 <-> 本地 server.py
             #    手机会话期间双向转发; 隧道断开 → 重建隧道; 本地断开 → 重连本地
             while True:
                 try:
-                    # 隧道可能已被中继标记为占用 (上一个手机还没结束), 先探测
                     local = connect_tcp(local_host, local_port, timeout=10.0)
                     logger.info(f"桥接隧道 → 本地 {local_host}:{local_port}")
                     why = bridge(tun, local, logger, name)
@@ -198,12 +221,15 @@ def run_client(relay_host: str, relay_ctrl_port: int, auth_key: str,
             logger.info("收到中断, 退出")
             return
         finally:
-            try:
-                if "ctrl" in dir(): ctrl.close()
-            except Exception: pass
-            try:
-                if "tun" in dir(): tun.close()
-            except Exception: pass
+            hb_stop.set()
+            if hb_thread and hb_thread.is_alive():
+                hb_thread.join(timeout=2.0)
+            if ctrl is not None:
+                try: ctrl.close()
+                except Exception: pass
+            if tun is not None:
+                try: tun.close()
+                except Exception: pass
 
 
 def main() -> None:
