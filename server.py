@@ -1207,10 +1207,11 @@ def send_connection_email(
     if lan_ips:
         lines.append(f"局域网地址: {', '.join(f'{ip}:{port}' for ip in lan_ips)}")
     lines.append(f"配对码: {pair_code} (只读权限)")
-    if admin_code:
-        lines.append(f"管理员码: {admin_code} (完整权限)")
     lines.append("")
     lines.append(f"发送时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    # BUG-283 安全修复: 邮件不再携带管理员码 (与 BUG-268 二维码策略一致),
+    # 防止邮件被转发/泄露时管理权限码外泄。管理码只通过 server.py --admin-code 在控制台查看。
 
     body = "\n".join(lines)
     try:
@@ -1223,14 +1224,21 @@ def send_connection_email(
         msg["From"] = smtp_user
         msg["To"] = to_addr
 
-        # SSL 465 优先, 失败回退 STARTTLS 587
+        # SSL 465 优先, 失败回退 STARTTLS 587 (BUG-283: 尊重用户配置的 smtp_port)
         last_err: str = ""
-        for ssl_use in (True, False) if smtp_port in (0, None) else ((smtp_port == 465),):
+        # 用户显式指定端口 → 按其端口+模式尝试; 未指定 → 465 SSL 失败后回退 587 STARTTLS
+        if smtp_port in (465, 587):
+            attempts = [(smtp_port == 465, smtp_port)]
+        elif smtp_port:
+            attempts = [(True, smtp_port), (False, smtp_port)]
+        else:
+            attempts = [(True, 465), (False, 587)]
+        for ssl_use, use_port in attempts:
             try:
                 if ssl_use:
-                    s = smtplib.SMTP_SSL(smtp_server, 465, timeout=20)
+                    s = smtplib.SMTP_SSL(smtp_server, use_port, timeout=20)
                 else:
-                    s = smtplib.SMTP(smtp_server, 587, timeout=20)
+                    s = smtplib.SMTP(smtp_server, use_port, timeout=20)
                     s.starttls()
                 s.login(smtp_user, auth_code)
                 s.sendmail(smtp_user, [to_addr], msg.as_string())
@@ -1239,7 +1247,7 @@ def send_connection_email(
                 return True, ""
             except Exception as e:
                 last_err = str(e)
-                log.warning(f"邮件发送尝试失败 ({'SSL465' if ssl_use else 'STARTTLS587'}): {e}")
+                log.warning(f"邮件发送尝试失败 ({'SSL' if ssl_use else 'STARTTLS'} {use_port}): {e}")
         return False, last_err
     except Exception as e:
         log.error(f"邮件发送异常: {e}")
