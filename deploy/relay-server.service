@@ -1,0 +1,29 @@
+# PhotoTrans 公网中继服务器 - systemd 服务 (Linux VPS 部署)
+# 安装:
+#   1. 复制到 /etc/systemd/system/relay-server.service
+#   2. 修改 ExecStart 里的路径、端口、密钥
+#   3. sudo systemctl daemon-reload && sudo systemctl enable --now relay-server
+#   4. 查看状态: sudo systemctl status relay-server / journalctl -u relay-server -f
+
+[Unit]
+Description=PhotoTrans Relay Server (公网中继)
+After=network.target
+
+[Service]
+Type=simple
+# 修改为你的实际路径和参数
+ExecStart=/usr/bin/python3 /opt/phototransdrive/relay.py \
+    --port 47820 \
+    --data-start 47830 \
+    --data-count 20 \
+    --auth-key 你的密钥
+# 也可用环境变量传密钥 (与 --auth-key 二选一, 环境变量更安全)
+# Environment=PT_RELAY_AUTH=你的密钥
+Restart=always
+RestartSec=3
+# 中继日志 (journalctl -u relay-server 查看)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

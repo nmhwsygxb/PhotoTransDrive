@@ -1,0 +1,26 @@
+# PhotoTrans 家里电脑中继客户端 - systemd 服务 (Linux 家里电脑可选)
+# 若家里电脑跑 Linux, 可用此文件开机自启 relay_client
+# 安装: 复制到 /etc/systemd/system/relay-client.service, 修改参数后
+#   sudo systemctl daemon-reload && sudo systemctl enable --now relay-client
+
+[Unit]
+Description=PhotoTrans Relay Client (家里电脑穿透 NAT)
+# 确保本地网盘 server.py 先启动 (改名为你的 server 服务名, 或用 Requires/After)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/phototransdrive/relay_client.py \
+    --relay 你的服务器IP或域名:47820 \
+    --auth-key 你的密钥 \
+    --local 127.0.0.1:47810 \
+    --name my-home-pc \
+    --retry 5
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
