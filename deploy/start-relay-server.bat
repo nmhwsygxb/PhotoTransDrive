@@ -16,8 +16,11 @@ set DATA_START=47830
 set DATA_COUNT=20
 
 cd /d %~dp0..
+REM 探测 python (优先 py launcher, 回退 python)
+set PY=python
+where py >nul 2>nul && set PY=py -3
 echo 启动中继服务器: 控制 %CTRL_PORT%, 数据 %DATA_START% 起共 %DATA_COUNT% 个
 echo 注意: 防火墙需放行 %CTRL_PORT% 和 %DATA_START%-%DATA_START% 段端口
 echo 按 Ctrl+C 退出
-python relay.py --port %CTRL_PORT% --data-start %DATA_START% --data-count %DATA_COUNT% --auth-key %AUTH_KEY%
+%PY% relay.py --port %CTRL_PORT% --data-start %DATA_START% --data-count %DATA_COUNT% --auth-key %AUTH_KEY%
 pause

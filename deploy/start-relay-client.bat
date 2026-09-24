@@ -19,9 +19,12 @@ REM 本地网盘地址 (默认 127.0.0.1:47810, 一般不用改)
 set LOCAL=127.0.0.1:47810
 
 cd /d %~dp0..
+REM 探测 python (优先 py launcher, 回退 python)
+set PY=python
+where py >nul 2>nul && set PY=py -3
 echo 启动中继客户端: %RELAY_ADDR%  (隧道名 %NAME%)
 echo 本机网盘: %LOCAL%
 echo 日志: %USERPROFILE%\.phototransrelay\logs\relay_client.log
 echo 按 Ctrl+C 退出
-python relay_client.py --relay %RELAY_ADDR% --auth-key %AUTH_KEY% --local %LOCAL% --name %NAME% --retry 5
+%PY% relay_client.py --relay %RELAY_ADDR% --auth-key %AUTH_KEY% --local %LOCAL% --name %NAME% --retry 5
 pause

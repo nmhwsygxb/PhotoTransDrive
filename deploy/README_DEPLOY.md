@@ -113,6 +113,12 @@ sudo systemctl restart relay-server
   `--auth-key` 防止陌生人占用隧道；敏感数据建议配合 VPN/SSH 隧道使用。
 - `--auth-key` 泄露 = 陌生人可注册隧道（数据端口仍需要手机正确配对码才能访问网盘）。
 - 中继不落盘任何业务数据（纯内存字节转发）。
+- **systemd 密钥权限**：`relay-server.service` 里的 `--auth-key` 是明文，默认权限 644 其他用户可读。
+  建议：`sudo chmod 600 /etc/systemd/system/relay-server.service`，
+  或改用 `EnvironmentFile=/etc/phototrans-relay.env`（chmod 600）+ `Environment=PT_RELAY_AUTH=...`
+  （去掉 ExecStart 里的 `--auth-key`）。
+- **DoS 面**：中继数据端口允许最多 256 个并发连接；公网暴露下攻击者用大量慢连接可占满名额
+  导致正常手机暂不可用。家庭/小规模使用风险低，生产级建议前置防火墙/仅放行可信 IP。
 
 ## 故障排查
 

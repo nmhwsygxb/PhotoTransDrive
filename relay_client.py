@@ -175,9 +175,12 @@ def run_client(relay_host: str, relay_ctrl_port: int, auth_key: str,
             logger.info(f"隧道就绪: {relay_host}:{data_port}")
 
             # 3) 心跳线程: 每 HEARTBEAT_INTERVAL 向控制连接发 PING, 保持 NAT 映射
-            #    连续失败 HEARTBEAT_STALE_LIMIT 次 → 判定中继链路死亡, 触发重建
-            def _heartbeat(ctrl_sock: socket.socket, fail_cnt: list[int],
-                           stop: threading.Event, log: logging.Logger) -> None:
+            #    连续失败 HEARTBEAT_STALE_LIMIT 次 → 判定中继链路死亡:
+            #    主动断开隧道, 让 bridge 立即返回 tunnel-closed → 主循环马上重建
+            #    (否则主循环会困在 bridge 的 select 空闲超时里, 最长 300s 才重建)
+            def _heartbeat(ctrl_sock: socket.socket, tun_sock: socket.socket,
+                           fail_cnt: list[int], stop: threading.Event,
+                           log: logging.Logger) -> None:
                 while not stop.is_set():
                     if stop.wait(HEARTBEAT_INTERVAL):
                         break
@@ -188,10 +191,19 @@ def run_client(relay_host: str, relay_ctrl_port: int, auth_key: str,
                         fail_cnt[0] += 1
                         log.warning(f"心跳发送失败 ({fail_cnt[0]}): {name}")
                         if fail_cnt[0] >= HEARTBEAT_STALE_LIMIT:
-                            return  # 链路死亡, 主循环的 recv 会察觉并重建
+                            log.warning("中继链路死亡, 主动断开隧道触发重建")
+                            try:
+                                tun_sock.shutdown(socket.SHUT_RDWR)
+                            except OSError:
+                                pass
+                            try:
+                                tun_sock.close()
+                            except OSError:
+                                pass
+                            return
 
             hb_thread = threading.Thread(
-                target=_heartbeat, args=(ctrl, hb_failed, hb_stop, logger),
+                target=_heartbeat, args=(ctrl, tun, hb_failed, hb_stop, logger),
                 daemon=True)
             hb_thread.start()
 
